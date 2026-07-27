@@ -1,0 +1,14 @@
+# Build artifacts
+App.exe
+*.exe
+*.o
+*.obj
+
+# Generated audio
+*.wav
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
