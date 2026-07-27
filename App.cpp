@@ -5,7 +5,6 @@
 #include <stdlib.h>
 #include <commdlg.h>
 #include <windowsx.h>
-
 #include <stdint.h>
 
 #pragma comment(lib, "winmm.lib")
@@ -70,6 +69,178 @@ static SampleCacheEntry *sampleCache = NULL;
 // clamp helper
 static inline int clamp_int(int v) { if (v > 32767) return 32767; if (v < -32768) return -32768; return v; }
 
+const char *get_sound_for_key(DWORD vk)
+{
+    for (size_t i = 0; i < keymap_count; ++i)
+    {
+        if (keymap[i].vk == vk && keymap[i].path && keymap[i].path[0])
+            return keymap[i].path;
+    }
+
+    if (vk == VK_SPACE)
+        return "space.wav";
+    if (vk == VK_RETURN)
+        return "enter.wav";
+    if (vk == VK_BACK)
+        return "backspace.wav";
+
+    if ((vk >= '0' && vk <= '9') || (vk >= 'A' && vk <= 'Z'))
+        return defaultSound;
+
+    return defaultSound;
+}
+
+void set_mapping(DWORD vk, const char *path)
+{
+    for (size_t i = 0; i < keymap_count; ++i)
+    {
+        if (keymap[i].vk == vk)
+        {
+            free(keymap[i].path);
+            keymap[i].path = _strdup(path);
+            post_refresh_gui();
+            return;
+        }
+    }
+
+    keymap = (KeyMapEntry*)realloc(keymap, sizeof(*keymap) * (keymap_count + 1));
+    keymap[keymap_count].vk = vk;
+    keymap[keymap_count].path = _strdup(path);
+    keymap_count++;
+    post_refresh_gui();
+}
+
+void save_keymap()
+{
+    FILE *f = fopen("keymap.json", "w");
+    if (!f) return;
+    fprintf(f, "{\n");
+    for (size_t i = 0; i < keymap_count; ++i)
+    {
+        fprintf(f, "  \"%u\": \"%s\"%s\n",
+                (unsigned)keymap[i].vk,
+                keymap[i].path ? keymap[i].path : "",
+                (i + 1 < keymap_count) ? "," : "");
+    }
+    fprintf(f, "}\n");
+    fclose(f);
+}
+
+void load_keymap()
+{
+    FILE *f = fopen("keymap.json", "r");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = (char*)malloc(sz + 1);
+    fread(buf, 1, sz, f);
+    buf[sz] = '\0';
+    fclose(f);
+
+    char *p = buf;
+    while (p && *p)
+    {
+        while (*p && (*p < '0' || *p > '9')) p++;
+        if (!*p) break;
+        unsigned int vk = (unsigned int)strtoul(p, &p, 10);
+        while (*p && *p != '"') p++;
+        if (!*p) break;
+        p++; // skip quote
+        char *start = p;
+        while (*p && *p != '"') p++;
+        if (!*p) break;
+        size_t len = p - start;
+        char *val = (char*)malloc(len + 1);
+        memcpy(val, start, len);
+        val[len] = '\0';
+        set_mapping(vk, val);
+        free(val);
+    }
+
+    free(buf);
+}
+
+DWORD WINAPI RemapThreadProc(LPVOID param)
+{
+    DWORD vk = (DWORD)(ULONG_PTR)param;
+    OPENFILENAMEA ofn;
+    CHAR szFile[MAX_PATH] = "";
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile);
+    ofn.lpstrFilter = "WAV Files\0*.wav\0All Files\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+
+    if (GetOpenFileNameA(&ofn))
+    {
+        set_mapping(vk, szFile);
+        save_keymap();
+        printf("Mapped key %u -> %s\n", vk, szFile);
+    }
+
+    awaiting_key_for_map = 0;
+    return 0;
+}
+
+BOOL WINAPI ConsoleHandler(DWORD signal)
+{
+    if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT)
+    {
+        if (keyboardHook)
+            UnhookWindowsHookEx(keyboardHook);
+        printf("Exiting...\n");
+        exit(0);
+    }
+    return TRUE;
+}
+
+LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
+{
+    if (nCode >= 0)
+    {
+        KBDLLHOOKSTRUCT *kbd = (KBDLLHOOKSTRUCT *)lParam;
+
+        if (wParam == WM_KEYDOWN)
+        {
+            // If user pressed F2, enter remapping mode
+            if (kbd->vkCode == VK_F2)
+            {
+                if (!awaiting_key_for_map)
+                {
+                    awaiting_key_for_map = 1;
+                    printf("Remap mode: press the key you want to change, then choose a WAV file.\n");
+                }
+                return CallNextHookEx(keyboardHook, nCode, wParam, lParam);
+            }
+
+            if (awaiting_key_for_map)
+            {
+                // capture this key for remapping
+                DWORD vk = kbd->vkCode;
+                // spawn file dialog on separate thread
+                CreateThread(NULL, 0, RemapThreadProc, (LPVOID)(ULONG_PTR)vk, 0, NULL);
+                // awaiting_key_for_map will be cleared by thread
+                return CallNextHookEx(keyboardHook, nCode, wParam, lParam);
+            }
+
+            const char *sound = get_sound_for_key(kbd->vkCode);
+            printf("Key Code: %lu -> %s\n", kbd->vkCode, sound);
+
+            // play via software mixer to allow overlapping short sounds
+            // mixer_play will be defined below
+            extern void mixer_play(const char*);
+            mixer_play(sound);
+        }
+    }
+
+    return CallNextHookEx(keyboardHook, nCode, wParam, lParam);
+}
+
+// --- Mixer implementation ---
 Sample *load_wav(const char *path)
 {
     // search cache
@@ -108,7 +279,7 @@ Sample *load_wav(const char *path)
     if (dataSize == 0 || audioFormat != 1 || bitsPerSample != 16) { fclose(f); return NULL; }
 
     size_t samples = dataSize / (channels * 2);
-    int16_t *buf = malloc(samples * sizeof(int16_t));
+    int16_t *buf = (int16_t*)malloc(samples * sizeof(int16_t));
     if (!buf) { fclose(f); return NULL; }
     fseek(f, dataPos, SEEK_SET);
     if (channels == 1) {
@@ -124,7 +295,7 @@ Sample *load_wav(const char *path)
     fclose(f);
 
     // add to cache
-    SampleCacheEntry *e = malloc(sizeof(*e));
+    SampleCacheEntry *e = (SampleCacheEntry*)malloc(sizeof(*e));
     e->path = _strdup(path);
     e->sample.data = buf;
     e->sample.samples = samples;
@@ -209,8 +380,8 @@ int mixer_init()
     MMRESULT r = waveOutOpen(&hWaveOut, WAVE_MAPPER, &wf, (DWORD_PTR)waveOutProcCallback, 0, CALLBACK_FUNCTION);
     if (r != MMSYSERR_NOERROR) return 0;
 
-    mixBuffers[0] = malloc(MIX_BUFF_SAMPLES * sizeof(short));
-    mixBuffers[1] = malloc(MIX_BUFF_SAMPLES * sizeof(short));
+    mixBuffers[0] = (short*)malloc(MIX_BUFF_SAMPLES * sizeof(short));
+    mixBuffers[1] = (short*)malloc(MIX_BUFF_SAMPLES * sizeof(short));
     memset(voices, 0, sizeof(voices));
 
     CreateThread(NULL, 0, MixerThread, NULL, 0, NULL);
@@ -235,94 +406,7 @@ void mixer_play(const char *path)
     LeaveCriticalSection(&mixerLock);
 }
 
-// --- end mixer ---
-
-const char *get_sound_for_key(DWORD vk)
-{
-    if (vk == VK_SPACE)
-        return "space.wav";
-    if (vk == VK_RETURN)
-        return "enter.wav";
-    if (vk == VK_BACK)
-        return "backspace.wav";
-
-    if ((vk >= '0' && vk <= '9') || (vk >= 'A' && vk <= 'Z'))
-        return defaultSound;
-
-    return defaultSound;
-}
-
-void set_mapping(DWORD vk, const char *path)
-{
-    for (size_t i = 0; i < keymap_count; ++i)
-    {
-        if (keymap[i].vk == vk)
-        {
-            free(keymap[i].path);
-            keymap[i].path = _strdup(path);
-            return;
-        }
-    }
-
-    keymap = realloc(keymap, sizeof(*keymap) * (keymap_count + 1));
-    keymap[keymap_count].vk = vk;
-    keymap[keymap_count].path = _strdup(path);
-    keymap_count++;
-    post_refresh_gui();
-}
-
-void save_keymap()
-{
-    FILE *f = fopen("keymap.json", "w");
-    if (!f) return;
-    fprintf(f, "{\n");
-    for (size_t i = 0; i < keymap_count; ++i)
-    {
-        fprintf(f, "  \"%u\": \"%s\"%s\n",
-                (unsigned)keymap[i].vk,
-                keymap[i].path ? keymap[i].path : "",
-                (i + 1 < keymap_count) ? "," : "");
-    }
-    fprintf(f, "}\n");
-    fclose(f);
-}
-
-void load_keymap()
-{
-    FILE *f = fopen("keymap.json", "r");
-    if (!f) return;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc(sz + 1);
-    fread(buf, 1, sz, f);
-    buf[sz] = '\0';
-    fclose(f);
-
-    char *p = buf;
-    while (p && *p)
-    {
-        while (*p && (*p < '0' || *p > '9')) p++;
-        if (!*p) break;
-        unsigned int vk = (unsigned int)strtoul(p, &p, 10);
-        while (*p && *p != '"') p++;
-        if (!*p) break;
-        p++; // skip quote
-        char *start = p;
-        while (*p && *p != '"') p++;
-        if (!*p) break;
-        size_t len = p - start;
-        char *val = malloc(len + 1);
-        memcpy(val, start, len);
-        val[len] = '\0';
-        set_mapping(vk, val);
-        free(val);
-    }
-
-    free(buf);
-    post_refresh_gui();
-}
-
+// --- GUI and main ---
 LRESULT CALLBACK MappingWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
@@ -386,83 +470,6 @@ DWORD WINAPI GuiThreadProc(LPVOID param)
     }
 
     return 0;
-}
-
-DWORD WINAPI RemapThreadProc(LPVOID param)
-{
-    DWORD vk = (DWORD)(ULONG_PTR)param;
-    OPENFILENAMEA ofn;
-    CHAR szFile[MAX_PATH] = "";
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = NULL;
-    ofn.lpstrFile = szFile;
-    ofn.nMaxFile = sizeof(szFile);
-    ofn.lpstrFilter = "WAV Files\0*.wav\0All Files\0*.*\0";
-    ofn.nFilterIndex = 1;
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
-
-    if (GetOpenFileNameA(&ofn))
-    {
-        set_mapping(vk, szFile);
-        save_keymap();
-        printf("Mapped key %u -> %s\n", vk, szFile);
-    }
-
-    awaiting_key_for_map = 0;
-    return 0;
-}
-
-BOOL WINAPI ConsoleHandler(DWORD signal)
-{
-    if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT)
-    {
-        if (keyboardHook)
-            UnhookWindowsHookEx(keyboardHook);
-        printf("Exiting...\n");
-        exit(0);
-    }
-    return TRUE;
-}
-
-LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
-{
-    if (nCode >= 0)
-    {
-        KBDLLHOOKSTRUCT *kbd = (KBDLLHOOKSTRUCT *)lParam;
-
-        if (wParam == WM_KEYDOWN)
-        {
-            // If user pressed F2, enter remapping mode
-            if (kbd->vkCode == VK_F2)
-            {
-                if (!awaiting_key_for_map)
-                {
-                    awaiting_key_for_map = 1;
-                    printf("Remap mode: press the key you want to change, then choose a WAV file.\n");
-                }
-                return CallNextHookEx(keyboardHook, nCode, wParam, lParam);
-            }
-
-            if (awaiting_key_for_map)
-            {
-                // capture this key for remapping
-                DWORD vk = kbd->vkCode;
-                // spawn file dialog on separate thread
-                CreateThread(NULL, 0, RemapThreadProc, (LPVOID)(ULONG_PTR)vk, 0, NULL);
-                // awaiting_key_for_map will be cleared by thread
-                return CallNextHookEx(keyboardHook, nCode, wParam, lParam);
-            }
-
-            const char *sound = get_sound_for_key(kbd->vkCode);
-            printf("Key Code: %lu -> %s\n", kbd->vkCode, sound);
-
-            // play via software mixer to allow overlapping short sounds
-            mixer_play(sound);
-        }
-    }
-
-    return CallNextHookEx(keyboardHook, nCode, wParam, lParam);
 }
 
 int main(int argc, char **argv)
